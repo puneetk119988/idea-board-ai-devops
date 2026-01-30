@@ -1,0 +1,1 @@
+output "vpc_id" { value = null }

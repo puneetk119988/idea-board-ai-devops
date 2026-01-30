@@ -1,0 +1,77 @@
+name: AI-Powered CI/CD
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Backend unit sanity
+        run: |
+          python -V
+          cd backend
+          python -m pip install -r requirements.txt
+          python -c "from app.main import app; print('backend import ok')"
+
+      - name: Frontend build sanity
+        run: |
+          cd frontend
+          npm install
+          npm run build
+
+  deploy:
+    needs: [build-test]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'issue_comment' && contains(github.event.comment.body, '/deploy-preview'))
+    steps:
+      - uses: actions/checkout@v4
+
+      # Option A: set KUBECONFIG_B64 secret (base64 kubeconfig)
+      - name: Setup kubeconfig
+        if: env.KUBECONFIG_B64 != ''
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          mkdir -p ~/.kube
+          echo "$KUBECONFIG_B64" | base64 -d > ~/.kube/config
+      # Option B (recommended in real world): use OIDC for AWS/GCP auth instead
+
+      - name: Decide environment
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            echo "name=preview" >> $GITHUB_OUTPUT
+          else
+            echo "name=prod" >> $GITHUB_OUTPUT
+          fi
+
+      - name: AI generate deployment plan
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TARGET_ENV: ${{ steps.env.outputs.name }}
+        run: |
+          python .github/scripts/ai_plan.py "$TARGET_ENV" > plan.sh
+          echo "=== AI PLAN ==="
+          cat plan.sh
+
+      - name: Execute deployment plan
+        run: |
+          bash plan.sh
+
+      - name: Post-deploy health check
+        run: |
+          python .github/scripts/health_check.py
+
+      - name: AI analyze logs (optional)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python .github/scripts/ai_analyze_logs.py || true
