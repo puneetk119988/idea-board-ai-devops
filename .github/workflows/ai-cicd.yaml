@@ -40,11 +40,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Defaults for push/main
           ENVIRONMENT="prod"
           GOAL="balanced"
           PREVIEW_NAME=""
-
           SHOULD_RUN="false"
 
           if [[ "${{ github.event_name }}" == "push" ]]; then
@@ -56,10 +54,7 @@ jobs:
             PREVIEW_NAME="${{ github.event.inputs.preview_name }}"
           elif [[ "${{ github.event_name }}" == "issue_comment" ]]; then
             BODY="${{ github.event.comment.body }}"
-            # Supported:
-            # /deploy prod goal=ha
-            # /deploy staging goal=cost
-            # /deploy-preview feature-x goal=cost
+
             if echo "$BODY" | grep -qE '^/deploy(\s|$)'; then
               SHOULD_RUN="true"
               ENVIRONMENT="$(echo "$BODY" | awk '{print $2}' | tr -d '\r' || true)"
@@ -86,36 +81,46 @@ jobs:
     if: needs.decide.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       ENVIRONMENT: ${{ needs.decide.outputs.environment }}
       GOAL: ${{ needs.decide.outputs.goal }}
       PREVIEW_NAME: ${{ needs.decide.outputs.preview_name }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure AWS + kubectl (EKS)
+      - name: Configure AWS credentials (EKS token needs this)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Debug AWS identity (must succeed)
         shell: bash
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          set -euo pipefail
+          aws --version
+          aws sts get-caller-identity
+          aws configure list
+
+      - name: Write kubeconfig from secret and test cluster access
+        shell: bash
         run: |
           set -euo pipefail
 
-          if [[ -z "${AWS_ACCESS_KEY_ID}" || -z "${AWS_SECRET_ACCESS_KEY}" || -z "${AWS_REGION}" ]]; then
-            echo "Missing AWS secrets (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION)."
-            exit 1
-          fi
-
           if [[ -z "${{ secrets.KUBECONFIG_B64 }}" ]]; then
-            echo "Missing secret KUBECONFIG_B64."
+            echo "Missing secret KUBECONFIG_B64"
             exit 1
           fi
 
           echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > kubeconfig
           export KUBECONFIG="$PWD/kubeconfig"
 
-          aws --version
+          echo "==== kubeconfig exec snippet ===="
+          kubectl config view --raw | sed -n '1,200p' | grep -nE 'exec:|command:|args:|env:' -A3 || true
+
+          echo "==== kubectl test ===="
           kubectl version --client
           kubectl get nodes
 
@@ -143,6 +148,8 @@ jobs:
         run: |
           set -euo pipefail
           python .github/scripts/ai_plan.py "$ENVIRONMENT" > /tmp/deploy_plan.sh
+          chmod +x /tmp/deploy_plan.sh
+
           echo "### AI Deployment Plan" >> "$GITHUB_STEP_SUMMARY"
           echo '```bash' >> "$GITHUB_STEP_SUMMARY"
           sed 's/OPENAI_API_KEY=.*/OPENAI_API_KEY=***redacted***/g' /tmp/deploy_plan.sh >> "$GITHUB_STEP_SUMMARY"
