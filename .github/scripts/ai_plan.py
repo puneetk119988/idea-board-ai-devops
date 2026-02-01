@@ -6,18 +6,24 @@ env_name = sys.argv[1] if len(sys.argv) > 1 else "prod"
 api_key = os.getenv("OPENAI_API_KEY", "")
 
 # Fallback plan if no API key configured (keeps repo runnable)
+# IMPORTANT: must match your actual repo filenames and service names.
 fallback = textwrap.dedent(f"""#!/usr/bin/env bash
 set -euo pipefail
 echo "Deploying to environment: {env_name}"
 
 kubectl get ns idea-board >/dev/null 2>&1 || kubectl apply -f k8s/namespace.yaml
-kubectl apply -f k8s/backend-secret.yaml
-kubectl apply -f k8s/postgres.yaml
+
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/secrets.yaml
+
+kubectl apply -f k8s/backend-service.yaml
 kubectl apply -f k8s/backend-deployment.yaml
+
 kubectl apply -f k8s/frontend-deployment.yaml
+kubectl apply -f k8s/frontend-service.yaml
 
 echo "Done. Check service:"
-kubectl -n idea-board get svc frontend
+kubectl -n idea-board get svc frontend-svc
 """)
 
 if not api_key:
@@ -56,7 +62,8 @@ try:
     with urllib.request.urlopen(req, timeout=30) as r:
         data = json.loads(r.read().decode("utf-8"))
         script = data["choices"][0]["message"]["content"]
-        # Minimal hardening: ensure it looks like a bash script
+
+        # Minimal hardening: ensure it looks like a bash script and uses kubectl
         if "kubectl" not in script:
             print(fallback)
         else:

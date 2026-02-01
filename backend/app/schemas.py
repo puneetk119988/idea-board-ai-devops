@@ -1,10 +1,13 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from datetime import datetime
 
 class IdeaCreate(BaseModel):
-    content: str = Field(min_length=1, max_length=2000)
+    content: str
 
 class IdeaOut(BaseModel):
     id: int
     content: str
     created_at: datetime
+
+    # Pydantic v2 replacement for orm_mode = True
+    model_config = {"from_attributes": True}

@@ -1,77 +1,158 @@
-name: AI-Powered CI/CD
+name: AI DevOps CI/CD
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    types: [opened, synchronize, reopened]
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to deploy (staging|prod|preview)"
+        required: true
+        default: "prod"
+      goal:
+        description: "High-level goal (cost|balanced|ha)"
+        required: true
+        default: "balanced"
+      preview_name:
+        description: "Preview name (only used if environment=preview)"
+        required: false
+        default: ""
   issue_comment:
     types: [created]
 
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
 jobs:
-  build-test:
+  decide:
     runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.parse.outputs.should_run }}
+      environment: ${{ steps.parse.outputs.environment }}
+      goal: ${{ steps.parse.outputs.goal }}
+      preview_name: ${{ steps.parse.outputs.preview_name }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Backend unit sanity
+      - name: Parse trigger
+        id: parse
+        shell: bash
         run: |
-          python -V
-          cd backend
-          python -m pip install -r requirements.txt
-          python -c "from app.main import app; print('backend import ok')"
+          set -euo pipefail
 
-      - name: Frontend build sanity
-        run: |
-          cd frontend
-          npm install
-          npm run build
+          # Defaults for push/main
+          ENVIRONMENT="prod"
+          GOAL="balanced"
+          PREVIEW_NAME=""
 
-  deploy:
-    needs: [build-test]
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || (github.event_name == 'issue_comment' && contains(github.event.comment.body, '/deploy-preview'))
-    steps:
-      - uses: actions/checkout@v4
+          SHOULD_RUN="false"
 
-      # Option A: set KUBECONFIG_B64 secret (base64 kubeconfig)
-      - name: Setup kubeconfig
-        if: env.KUBECONFIG_B64 != ''
-        env:
-          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
-        run: |
-          mkdir -p ~/.kube
-          echo "$KUBECONFIG_B64" | base64 -d > ~/.kube/config
-      # Option B (recommended in real world): use OIDC for AWS/GCP auth instead
-
-      - name: Decide environment
-        id: env
-        run: |
-          if [ "${{ github.event_name }}" = "issue_comment" ]; then
-            echo "name=preview" >> $GITHUB_OUTPUT
-          else
-            echo "name=prod" >> $GITHUB_OUTPUT
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            SHOULD_RUN="true"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            SHOULD_RUN="true"
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+            GOAL="${{ github.event.inputs.goal }}"
+            PREVIEW_NAME="${{ github.event.inputs.preview_name }}"
+          elif [[ "${{ github.event_name }}" == "issue_comment" ]]; then
+            BODY="${{ github.event.comment.body }}"
+            # Supported:
+            # /deploy prod goal=ha
+            # /deploy staging goal=cost
+            # /deploy-preview feature-x goal=cost
+            if echo "$BODY" | grep -qE '^/deploy(\s|$)'; then
+              SHOULD_RUN="true"
+              ENVIRONMENT="$(echo "$BODY" | awk '{print $2}' | tr -d '\r' || true)"
+              [[ -z "$ENVIRONMENT" ]] && ENVIRONMENT="prod"
+              GOAL="$(echo "$BODY" | sed -n 's/.*goal=\([a-zA-Z0-9_-]*\).*/\1/p' | head -n1 || true)"
+              [[ -z "$GOAL" ]] && GOAL="balanced"
+            elif echo "$BODY" | grep -qE '^/deploy-preview(\s|$)'; then
+              SHOULD_RUN="true"
+              ENVIRONMENT="preview"
+              PREVIEW_NAME="$(echo "$BODY" | awk '{print $2}' | tr -d '\r' || true)"
+              [[ -z "$PREVIEW_NAME" ]] && PREVIEW_NAME="preview"
+              GOAL="$(echo "$BODY" | sed -n 's/.*goal=\([a-zA-Z0-9_-]*\).*/\1/p' | head -n1 || true)"
+              [[ -z "$GOAL" ]] && GOAL="cost"
+            fi
           fi
 
-      - name: AI generate deployment plan
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          TARGET_ENV: ${{ steps.env.outputs.name }}
+          echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
+          echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+          echo "goal=$GOAL" >> "$GITHUB_OUTPUT"
+          echo "preview_name=$PREVIEW_NAME" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: decide
+    if: needs.decide.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ENVIRONMENT: ${{ needs.decide.outputs.environment }}
+      GOAL: ${{ needs.decide.outputs.goal }}
+      PREVIEW_NAME: ${{ needs.decide.outputs.preview_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl (expects KUBECONFIG_B64 secret)
+        shell: bash
         run: |
-          python .github/scripts/ai_plan.py "$TARGET_ENV" > plan.sh
-          echo "=== AI PLAN ==="
-          cat plan.sh
+          set -euo pipefail
+          if [[ -z "${{ secrets.KUBECONFIG_B64 }}" ]]; then
+            echo "Missing secret KUBECONFIG_B64. Add your kubeconfig (base64) to GitHub Secrets."
+            exit 1
+          fi
+          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > kubeconfig
+          export KUBECONFIG="$PWD/kubeconfig"
+          kubectl version --client
+          kubectl get nodes
+
+      - name: AI suggests deployment settings (replicas)
+        id: suggest
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/ai_suggest_config.py "$ENVIRONMENT" "$GOAL" > suggested.env
+          cat suggested.env >> "$GITHUB_STEP_SUMMARY"
+          source suggested.env
+          echo "backend_replicas=${BACKEND_REPLICAS}" >> "$GITHUB_OUTPUT"
+          echo "frontend_replicas=${FRONTEND_REPLICAS}" >> "$GITHUB_OUTPUT"
+
+      - name: Apply replicas (patch)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export KUBECONFIG="$PWD/kubeconfig"
+          kubectl -n idea-board scale deploy/backend --replicas=${{ steps.suggest.outputs.backend_replicas }} || true
+          kubectl -n idea-board scale deploy/frontend --replicas=${{ steps.suggest.outputs.frontend_replicas }} || true
+
+      - name: AI generates safe kubectl plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/ai_plan.py "$ENVIRONMENT" > /tmp/deploy_plan.sh
+          echo "### AI Deployment Plan" >> "$GITHUB_STEP_SUMMARY"
+          echo '```bash' >> "$GITHUB_STEP_SUMMARY"
+          sed 's/OPENAI_API_KEY=.*/OPENAI_API_KEY=***redacted***/g' /tmp/deploy_plan.sh >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Execute deployment plan
+        shell: bash
         run: |
-          bash plan.sh
+          set -euo pipefail
+          export KUBECONFIG="$PWD/kubeconfig"
+          bash /tmp/deploy_plan.sh
 
-      - name: Post-deploy health check
+      - name: Wait for rollout
+        shell: bash
         run: |
-          python .github/scripts/health_check.py
+          set -euo pipefail
+          export KUBECONFIG="$PWD/kubeconfig"
+          kubectl -n idea-board rollout status deploy/backend --timeout=180s
+          kubectl -n idea-board rollout status deploy/frontend --timeout=180s
 
-      - name: AI analyze logs (optional)
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      - name: AI health check (logs + optional rollback)
+        shell: bash
         run: |
-          python .github/scripts/ai_analyze_logs.py || true
+          set -euo pipefail
+          export KUBECONFIG="$PWD/kubeconfig"
+          python .github/scripts/ai_healthcheck.py

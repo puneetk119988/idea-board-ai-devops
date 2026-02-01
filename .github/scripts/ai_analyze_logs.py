@@ -1,59 +1,66 @@
 #!/usr/bin/env python3
-import os, json, subprocess, urllib.request, textwrap, sys
+import os, sys, json
+import urllib.request
 
+env = sys.argv[1] if len(sys.argv) > 1 else "prod"
+goal = sys.argv[2] if len(sys.argv) > 2 else "balanced"
 api_key = os.getenv("OPENAI_API_KEY", "")
+
+# Deterministic fallback
+def fallback(env: str, goal: str) -> dict:
+    if env == "prod" or goal == "ha":
+        return {"BACKEND_REPLICAS": 2, "FRONTEND_REPLICAS": 2}
+    if goal == "cost":
+        return {"BACKEND_REPLICAS": 1, "FRONTEND_REPLICAS": 1}
+    return {"BACKEND_REPLICAS": 2, "FRONTEND_REPLICAS": 2}
+
 if not api_key:
-    print("No OPENAI_API_KEY set; skipping AI log analysis.")
+    cfg = fallback(env, goal)
+    print(f"BACKEND_REPLICAS={cfg['BACKEND_REPLICAS']}")
+    print(f"FRONTEND_REPLICAS={cfg['FRONTEND_REPLICAS']}")
     sys.exit(0)
 
-def sh(cmd: str) -> str:
-    return subprocess.check_output(cmd, shell=True, text=True)
+prompt = f"""
+You are a DevOps assistant. Suggest replica counts for a small demo app on Kubernetes.
 
-# Grab recent logs
-backend_pods = sh("kubectl -n idea-board get pods -l app=backend -o name").strip().splitlines()
-if not backend_pods:
-    print("No backend pods found.")
-    sys.exit(0)
+Inputs:
+- environment: {env}
+- goal: {goal} (cost|balanced|ha)
 
-logs = ""
-for p in backend_pods[:2]:
-    logs += f"\n=== {p} ===\n"
-    logs += sh(f"kubectl -n idea-board logs {p} --tail=200")
-
-prompt = textwrap.dedent(f"""Analyze these Kubernetes application logs and decide if deployment is healthy.
-Return JSON with keys:
-- status: HEALTHY or ROLLBACK
-- summary: short human summary
-- evidence: list of 2-5 bullet strings referencing log patterns
-
-LOGS:
-{logs}
-""")
+Rules:
+- Return ONLY strict JSON: {{"backend_replicas": <int>, "frontend_replicas": <int>}}
+- Use integers between 1 and 4
+- Keep it simple and conservative.
+"""
 
 payload = {
-  "model": "gpt-4o-mini",
-  "messages": [
-    {"role": "system", "content": "Return ONLY JSON. No markdown."},
-    {"role": "user", "content": prompt}
-  ],
-  "temperature": 0.2
+    "model": "gpt-4o-mini",
+    "messages": [
+        {"role": "system", "content": "Return only strict JSON. No markdown."},
+        {"role": "user", "content": prompt},
+    ],
+    "temperature": 0.2,
 }
 
 req = urllib.request.Request(
     "https://api.openai.com/v1/chat/completions",
     data=json.dumps(payload).encode("utf-8"),
     headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-    method="POST"
+    method="POST",
 )
 
-with urllib.request.urlopen(req, timeout=30) as r:
-    data = json.loads(r.read().decode("utf-8"))
-    txt = data["choices"][0]["message"]["content"]
-
-result = json.loads(txt)
-print("AI_STATUS:", result.get("status"))
-print("AI_SUMMARY:", result.get("summary"))
-
-if result.get("status") == "ROLLBACK":
-    print("Triggering rollback for backend…")
-    subprocess.check_call("kubectl -n idea-board rollout undo deploy/backend", shell=True)
+try:
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read().decode("utf-8"))
+        content = data["choices"][0]["message"]["content"].strip()
+        cfg = json.loads(content)
+        b = int(cfg["backend_replicas"])
+        f = int(cfg["frontend_replicas"])
+        b = min(max(b, 1), 4)
+        f = min(max(f, 1), 4)
+        print(f"BACKEND_REPLICAS={b}")
+        print(f"FRONTEND_REPLICAS={f}")
+except Exception:
+    cfg = fallback(env, goal)
+    print(f"BACKEND_REPLICAS={cfg['BACKEND_REPLICAS']}")
+    print(f"FRONTEND_REPLICAS={cfg['FRONTEND_REPLICAS']}")
