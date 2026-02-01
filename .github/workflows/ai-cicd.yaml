@@ -93,16 +93,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure kubectl (expects KUBECONFIG_B64 secret)
+      - name: Configure AWS + kubectl (EKS)
         shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
         run: |
           set -euo pipefail
-          if [[ -z "${{ secrets.KUBECONFIG_B64 }}" ]]; then
-            echo "Missing secret KUBECONFIG_B64. Add your kubeconfig (base64) to GitHub Secrets."
+
+          if [[ -z "${AWS_ACCESS_KEY_ID}" || -z "${AWS_SECRET_ACCESS_KEY}" || -z "${AWS_REGION}" ]]; then
+            echo "Missing AWS secrets (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION)."
             exit 1
           fi
+
+          if [[ -z "${{ secrets.KUBECONFIG_B64 }}" ]]; then
+            echo "Missing secret KUBECONFIG_B64."
+            exit 1
+          fi
+
           echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > kubeconfig
           export KUBECONFIG="$PWD/kubeconfig"
+
+          aws --version
           kubectl version --client
           kubectl get nodes
 
